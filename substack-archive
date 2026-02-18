@@ -86,6 +86,29 @@ def parse_substack_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def check_expired_cookies(cookies_file: str) -> list[str]:
+    """Check a Netscape-format cookies file for expired cookies. Returns list of expired cookie names."""
+    expired = []
+    now = time.time()
+    with open(cookies_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                expiry_str = parts[4]
+                name = parts[5]
+                try:
+                    expiry = int(expiry_str)
+                except ValueError:
+                    continue
+                # expiry of 0 means session cookie (no expiry)
+                if expiry != 0 and expiry < now:
+                    expired.append(name)
+    return expired
+
+
 def build_session(cookies_file: str | None) -> requests.Session:
     """Build a requests session, optionally with cookies from a cookies.txt file."""
     session = requests.Session()
@@ -370,6 +393,15 @@ Authentication (for private/paid substacks):
         cookies_file = str(Path(args.cookies_file).expanduser().resolve())
         if not os.path.exists(cookies_file):
             print(f"Error: cookies file not found: {cookies_file}", file=sys.stderr)
+            sys.exit(1)
+
+        expired = check_expired_cookies(cookies_file)
+        if expired:
+            print(
+                f"Error: cookies file contains {len(expired)} expired cookie(s): {', '.join(expired)}\n"
+                "Please export fresh cookies from your browser and try again.",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
     # -- Resolve base URL and output dir --
