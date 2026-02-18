@@ -86,9 +86,16 @@ def parse_substack_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def check_expired_cookies(cookies_file: str) -> list[str]:
-    """Check a Netscape-format cookies file for expired cookies. Returns list of expired cookie names."""
-    expired = []
+AUTH_COOKIE_NAMES = {"substack.sid", "connect.sid"}
+
+
+def check_auth_cookies(cookies_file: str) -> tuple[bool, list[str]]:
+    """Check that at least one auth cookie (substack.sid or connect.sid) is present and not expired.
+
+    Returns (ok, problems) where ok is True if a valid auth cookie exists,
+    and problems is a list of human-readable issue strings.
+    """
+    found: dict[str, bool] = {}  # name -> is_valid (not expired)
     now = time.time()
     with open(cookies_file) as f:
         for line in f:
@@ -99,14 +106,23 @@ def check_expired_cookies(cookies_file: str) -> list[str]:
             if len(parts) >= 7:
                 expiry_str = parts[4]
                 name = parts[5]
+                if name not in AUTH_COOKIE_NAMES:
+                    continue
                 try:
                     expiry = int(expiry_str)
                 except ValueError:
                     continue
                 # expiry of 0 means session cookie (no expiry)
-                if expiry != 0 and expiry < now:
-                    expired.append(name)
-    return expired
+                is_valid = expiry == 0 or expiry >= now
+                # If we see the same cookie multiple times, it's valid if any instance is valid
+                found[name] = found.get(name, False) or is_valid
+
+    if not found:
+        return False, ["No auth cookies found (need substack.sid or connect.sid)"]
+
+    problems = [f"'{name}' is expired" for name, valid in found.items() if not valid]
+    has_valid = any(valid for valid in found.values())
+    return has_valid, problems
 
 
 def build_session(cookies_file: str | None) -> requests.Session:
@@ -395,10 +411,10 @@ Authentication (for private/paid substacks):
             print(f"Error: cookies file not found: {cookies_file}", file=sys.stderr)
             sys.exit(1)
 
-        expired = check_expired_cookies(cookies_file)
-        if expired:
+        auth_ok, problems = check_auth_cookies(cookies_file)
+        if not auth_ok:
             print(
-                f"Error: cookies file contains {len(expired)} expired cookie(s): {', '.join(expired)}\n"
+                f"Error: {'; '.join(problems)}\n"
                 "Please export fresh cookies from your browser and try again.",
                 file=sys.stderr,
             )
