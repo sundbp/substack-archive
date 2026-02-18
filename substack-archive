@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""
+substack-archive — Full and incremental Substack archiver using single-file.
+
+Supports private/paid subscriptions via a Netscape-format cookies.txt file.
+
+Usage:
+    substack-archive <substack_url> [options]
+
+Examples:
+    # Public substack, full archive
+    substack-archive https://example.substack.com
+
+    # Private subscription with cookies file
+    substack-archive https://example.substack.com -c ~/cookies.txt
+
+    # Incremental update of existing archive
+    substack-archive https://example.substack.com -c ~/cookies.txt --incremental
+
+    # Custom output directory
+    substack-archive https://example.substack.com -o ~/substack-backups/example
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import hashlib
+from datetime import datetime, UTC
+from pathlib import Path
+from urllib.parse import urlparse
+
+try:
+    import requests
+except ImportError:
+    print("Error: 'requests' is required. Install with: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+API_ARCHIVE_PATH = "/api/v1/archive"
+API_LIMIT = 50  # max posts per API request
+DEFAULT_OUTPUT_DIR = "substack-archive"
+MANIFEST_FILE = ".archive-manifest.json"
+SINGLEFILE_BIN = "single-file"
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 3  # seconds
+REQUEST_DELAY = 1.5  # polite delay between downloads
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def slugify(text: str) -> str:
+    """Convert text to a filesystem-safe slug."""
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_]+", "-", text)
+    text = re.sub(r"-+", "-", text)
+    return text[:120].strip("-")
+
+
+def check_singlefile() -> bool:
+    """Check if single-file is installed and accessible."""
+    try:
+        subprocess.run(
+            [SINGLEFILE_BIN, "--help"],
+            capture_output=True, timeout=10,
+        )
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
+def parse_substack_url(url: str) -> str:
+    """Normalize a Substack URL to its base (e.g. https://example.substack.com)."""
+    if not url.startswith("http"):
+        url = "https://" + url
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def build_session(cookies_file: str | None) -> requests.Session:
+    """Build a requests session, optionally with cookies from a cookies.txt file."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "substack-archive/1.0 (CLI archiver)",
+        "Accept": "application/json",
+    })
+
+    if cookies_file:
+        # Parse Netscape-format cookie file
+        with open(cookies_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    domain, _, path, secure, _expiry, name, value = parts[:7]
+                    session.cookies.set(name, value, domain=domain, path=path)
+
+    return session
+
+
+# ---------------------------------------------------------------------------
+# Manifest (for incremental archiving)
+# ---------------------------------------------------------------------------
+
+def load_manifest(output_dir: Path) -> dict:
+    """Load the archive manifest tracking previously downloaded posts."""
+    manifest_path = output_dir / MANIFEST_FILE
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            return json.load(f)
+    return {"version": 1, "posts": {}, "last_run": None}
+
+
+def save_manifest(output_dir: Path, manifest: dict):
+    """Persist the archive manifest."""
+    manifest["last_run"] = datetime.now(UTC).isoformat() + "Z"
+    manifest_path = output_dir / MANIFEST_FILE
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Substack API
+# ---------------------------------------------------------------------------
+
+def fetch_all_posts(base_url: str, session: requests.Session, verbose: bool = False) -> list[dict]:
+    """Fetch complete post list from the Substack archive API."""
+    posts = []
+    offset = 0
+
+    while True:
+        api_url = f"{base_url}{API_ARCHIVE_PATH}?sort=new&offset={offset}&limit={API_LIMIT}"
+        if verbose:
+            print(f"  Fetching post list (offset={offset})...")
+
+        resp = session.get(api_url, timeout=30)
+        resp.raise_for_status()
+        batch = resp.json()
+
+        if not batch:
+            break
+
+        posts.extend(batch)
+        offset += len(batch)
+
+        if len(batch) < API_LIMIT:
+            break
+
+        time.sleep(0.5)
+
+    return posts
+
+
+def get_post_metadata(post: dict) -> dict:
+    """Extract useful metadata from a post API object."""
+    post_date = post.get("post_date", "")
+    try:
+        dt = datetime.fromisoformat(post_date.replace("Z", "+00:00"))
+        date_str = dt.strftime("%Y-%m-%d")
+        date_iso = dt.isoformat()
+    except (ValueError, AttributeError):
+        date_str = "unknown-date"
+        date_iso = post_date
+
+    slug = post.get("slug", slugify(post.get("title", "untitled")))
+    title = post.get("title", "Untitled")
+    canonical = post.get("canonical_url", "")
+    post_id = str(post.get("id", hashlib.md5(slug.encode()).hexdigest()[:12]))
+    post_type = post.get("type", "newsletter")
+    audience = post.get("audience", "everyone")  # "everyone", "only_paid", "founding", etc.
+
+    return {
+        "id": post_id,
+        "slug": slug,
+        "title": title,
+        "date_str": date_str,
+        "date_iso": date_iso,
+        "url": canonical,
+        "type": post_type,
+        "audience": audience,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Download with single-file
+# ---------------------------------------------------------------------------
+
+def download_post(
+    url: str,
+    output_path: Path,
+    cookies_file: str | None = None,
+    verbose: bool = False,
+) -> bool:
+    """Download a single post as a self-contained HTML file using single-file."""
+    cmd = [
+        SINGLEFILE_BIN,
+        url,
+        str(output_path),
+    ]
+
+    if cookies_file:
+        cmd.extend(["--browser-cookies-file", cookies_file])
+
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 500:
+                return True
+            if verbose:
+                print(f"    Attempt {attempt} failed: {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            if verbose:
+                print(f"    Attempt {attempt} timed out")
+        except Exception as e:
+            if verbose:
+                print(f"    Attempt {attempt} error: {e}")
+
+        if attempt < RETRY_ATTEMPTS:
+            time.sleep(RETRY_DELAY)
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Index generator
+# ---------------------------------------------------------------------------
+
+def generate_index(output_dir: Path, manifest: dict, base_url: str):
+    """Generate a browsable HTML index of the archive."""
+    posts_by_year: dict[str, list] = {}
+    for post_id, info in sorted(
+        manifest["posts"].items(),
+        key=lambda x: x[1].get("date_iso", ""),
+        reverse=True,
+    ):
+        year = info.get("date_str", "unknown")[:4]
+        posts_by_year.setdefault(year, []).append(info)
+
+    html_parts = [
+        "<!DOCTYPE html>",
+        "<html><head>",
+        f"<title>Archive — {base_url}</title>",
+        "<meta charset='utf-8'>",
+        "<style>",
+        "  body { font-family: Georgia, serif; max-width: 720px; margin: 2em auto; padding: 0 1em; color: #1a1a1a; }",
+        "  h1 { border-bottom: 2px solid #ccc; padding-bottom: 0.3em; }",
+        "  h2 { color: #555; margin-top: 2em; }",
+        "  .post { margin: 0.6em 0; }",
+        "  .post a { color: #0066cc; text-decoration: none; }",
+        "  .post a:hover { text-decoration: underline; }",
+        "  .meta { color: #888; font-size: 0.85em; margin-left: 0.5em; }",
+        "  .badge { font-size: 0.75em; padding: 0.1em 0.4em; border-radius: 3px; margin-left: 0.5em; }",
+        "  .paid { background: #fff3cd; color: #856404; }",
+        "  .failed { background: #f8d7da; color: #721c24; }",
+        "  .stats { color: #666; font-size: 0.9em; margin-bottom: 2em; }",
+        "</style>",
+        "</head><body>",
+        f"<h1>📰 {base_url}</h1>",
+    ]
+
+    total = len(manifest["posts"])
+    failed = sum(1 for p in manifest["posts"].values() if not p.get("success", False))
+    html_parts.append(f'<p class="stats">{total} posts archived')
+    if failed:
+        html_parts.append(f' ({failed} failed)')
+    if manifest.get("last_run"):
+        html_parts.append(f' · Last updated: {manifest["last_run"][:10]}')
+    html_parts.append("</p>")
+
+    for year in sorted(posts_by_year, reverse=True):
+        html_parts.append(f"<h2>{year}</h2>")
+        for info in posts_by_year[year]:
+            filename = info.get("filename", "")
+            title = info.get("title", "Untitled")
+            date = info.get("date_str", "")
+            audience = info.get("audience", "everyone")
+            success = info.get("success", False)
+
+            badge = ""
+            if audience != "everyone":
+                badge += ' <span class="badge paid">paid</span>'
+            if not success:
+                badge += ' <span class="badge failed">failed</span>'
+
+            if success and filename:
+                html_parts.append(
+                    f'<div class="post"><a href="{filename}">{title}</a>'
+                    f'<span class="meta">{date}{badge}</span></div>'
+                )
+            else:
+                html_parts.append(
+                    f'<div class="post">{title}'
+                    f'<span class="meta">{date}{badge}</span></div>'
+                )
+
+    html_parts.append("</body></html>")
+
+    index_path = output_dir / "index.html"
+    with open(index_path, "w") as f:
+        f.write("\n".join(html_parts))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="substack-archive",
+        description="Archive a Substack newsletter to local disk using single-file.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s https://example.substack.com
+  %(prog)s example.substack.com -c ~/cookies.txt
+  %(prog)s example.substack.com -c ~/cookies.txt --incremental
+  %(prog)s example.substack.com -o ~/backups/example --verbose
+
+Authentication (for private/paid substacks):
+  Provide a Netscape-format cookies.txt file containing your Substack
+  session cookies. You can export this from your browser using extensions
+  like "Get cookies.txt LOCALLY" or "cookies.txt" for Chrome/Firefox.
+""",
+    )
+
+    parser.add_argument("url", help="Substack URL (e.g. https://example.substack.com)")
+    parser.add_argument("-o", "--output", default=".", help="Output directory (default: ./substack-archive/<n>)")
+    parser.add_argument("-c", "--cookies-file", help="Path to Netscape-format cookies.txt file")
+    parser.add_argument("--incremental", action="store_true", help="Only download new/updated posts")
+    parser.add_argument("--redownload-failed", action="store_true", help="Retry previously failed downloads")
+    parser.add_argument("--limit", type=int, default=0, help="Max posts to download (0=unlimited)")
+    parser.add_argument("--delay", type=float, default=REQUEST_DELAY, help=f"Delay between downloads in seconds (default: {REQUEST_DELAY})")
+    parser.add_argument("--no-index", action="store_true", help="Skip generating the HTML index page")
+    parser.add_argument("--dry-run", action="store_true", help="List posts without downloading")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--json-metadata", action="store_true", help="Save per-post JSON metadata alongside HTML")
+
+    args = parser.parse_args()
+
+    # -- Pre-flight checks --
+    if not check_singlefile():
+        print(
+            "Error: 'single-file' is not installed or not in PATH.\n"
+            "Install it with:\n"
+            "  npm install -g single-file-cli\n"
+            "See: https://github.com/gildas-lormeau/single-file-cli",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # -- Resolve cookies file --
+    cookies_file = None
+    if args.cookies_file:
+        cookies_file = str(Path(args.cookies_file).expanduser().resolve())
+        if not os.path.exists(cookies_file):
+            print(f"Error: cookies file not found: {cookies_file}", file=sys.stderr)
+            sys.exit(1)
+
+    # -- Resolve base URL and output dir --
+    base_url = parse_substack_url(args.url)
+    site_name = urlparse(base_url).netloc.split(".")[0]
+
+    if args.output:
+        output_dir = Path(args.output).expanduser().resolve()
+    else:
+        output_dir = Path.cwd() / DEFAULT_OUTPUT_DIR / site_name
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"📂 Archive directory: {output_dir}")
+
+    # -- Build session (for API calls; uses same cookies file) --
+    session = build_session(cookies_file)
+
+    # -- Fetch post list --
+    print(f"🔍 Fetching post list from {base_url}...")
+    try:
+        posts = fetch_all_posts(base_url, session, verbose=args.verbose)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 403:
+            print("Error: 403 Forbidden. Your cookies file may be invalid or expired.", file=sys.stderr)
+        else:
+            print(f"Error fetching posts: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error fetching posts: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not posts:
+        print("No posts found. Check the URL and authentication.")
+        sys.exit(0)
+
+    print(f"   Found {len(posts)} posts")
+
+    # -- Load manifest --
+    manifest = load_manifest(output_dir)
+
+    # -- Determine which posts to download --
+    to_download = []
+    for post in posts:
+        meta = get_post_metadata(post)
+
+        already_done = meta["id"] in manifest["posts"]
+        previously_failed = already_done and not manifest["posts"][meta["id"]].get("success", False)
+
+        if args.incremental and already_done and not previously_failed:
+            continue
+        if args.redownload_failed and previously_failed:
+            pass  # include it
+        elif args.incremental and already_done:
+            continue
+
+        to_download.append((post, meta))
+
+    if args.limit > 0:
+        to_download = to_download[:args.limit]
+
+    if not to_download:
+        print("✅ Archive is up to date — nothing to download.")
+        if not args.no_index:
+            generate_index(output_dir, manifest, base_url)
+            print(f"📄 Index updated: {output_dir / 'index.html'}")
+        sys.exit(0)
+
+    print(f"📥 Downloading {len(to_download)} posts...\n")
+
+    if args.dry_run:
+        for _, meta in to_download:
+            audience_tag = f" [{meta['audience']}]" if meta["audience"] != "everyone" else ""
+            print(f"  {meta['date_str']}  {meta['title']}{audience_tag}")
+            print(f"             {meta['url']}")
+        print(f"\n(Dry run — {len(to_download)} posts would be downloaded)")
+        sys.exit(0)
+
+    # -- Download loop --
+    success_count = 0
+    fail_count = 0
+
+    for i, (post, meta) in enumerate(to_download, 1):
+        filename = f"{meta['date_str']}_{meta['slug']}.html"
+        output_path = output_dir / filename
+
+        audience_tag = f" [{meta['audience']}]" if meta["audience"] != "everyone" else ""
+        print(f"  [{i}/{len(to_download)}] {meta['title']}{audience_tag}")
+
+        if args.verbose:
+            print(f"           URL: {meta['url']}")
+            print(f"           Out: {filename}")
+
+        ok = download_post(meta["url"], output_path, cookies_file, verbose=args.verbose)
+
+        manifest["posts"][meta["id"]] = {
+            "title": meta["title"],
+            "slug": meta["slug"],
+            "date_str": meta["date_str"],
+            "date_iso": meta["date_iso"],
+            "url": meta["url"],
+            "type": meta["type"],
+            "audience": meta["audience"],
+            "filename": filename,
+            "success": ok,
+            "downloaded_at": datetime.now(UTC).isoformat() + "Z",
+        }
+
+        if ok:
+            success_count += 1
+            print(f"           ✅ saved ({output_path.stat().st_size / 1024:.0f} KB)")
+        else:
+            fail_count += 1
+            print(f"           ❌ failed")
+
+        # Save per-post JSON metadata if requested
+        if args.json_metadata and ok:
+            json_path = output_path.with_suffix(".json")
+            with open(json_path, "w") as f:
+                json.dump(manifest["posts"][meta["id"]], f, indent=2)
+
+        # Save manifest periodically (every 10 posts)
+        if i % 10 == 0:
+            save_manifest(output_dir, manifest)
+
+        if i < len(to_download):
+            time.sleep(args.delay)
+
+    # -- Finalize --
+    save_manifest(output_dir, manifest)
+
+    if not args.no_index:
+        generate_index(output_dir, manifest, base_url)
+
+    print(f"\n{'─' * 50}")
+    print(f"✅ Done!  {success_count} saved, {fail_count} failed")
+    print(f"📂 {output_dir}")
+    if not args.no_index:
+        print(f"📄 Open {output_dir / 'index.html'} to browse the archive")
+
+
+if __name__ == "__main__":
+    main()
